@@ -2,15 +2,12 @@
 # Press Shift+F10 to execute it or replace it with your code.
 # Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
 
-import labelbox
-import urllib
-import json
-import requests
+
+import requests, io, cv2, tqdm, urllib, labelbox, json, os, copy
 import pandas as pd
 import numpy as np
-import os
+from PIL import Image
 from sklearn.model_selection import train_test_split
-import tqdm
 from datetime import date
 #Seed
 np.random.seed(69)
@@ -43,7 +40,7 @@ def mkdir(dir, name):
         os.mkdir(os.path.join(named_dir, 'labels'))
     return named_dir
 
-def setup_dir_for_yolo(dir):
+def setup_dir(dir):
     dirs = ['train', 'val', 'test']
     ret = {}
     for named_dir in dirs:
@@ -69,11 +66,10 @@ def get_quality_imgs(labels_export):
     return {'total_seeds': total_seeds, 'total_good_imgs': total_good_data, 'total_corn_seeds':total_corn_seeds, 'total_blurry':total_blurry_seeds}
 # Press the green button in the gutter to run the script.
 
-def download_save_img(label, img_name):
+def download_img(label):
     response = requests.get(label['Labeled Data'])
-    file = open(img_name, 'wb')
-    file.write(response.content)
-    file.close()
+    bytes_im = io.BytesIO(response.content)
+    return cv2.cvtColor(np.array(Image.open(bytes_im)), cv2.COLOR_RGB2BGR)
 
 def convert_corn_label_box(corn_object):
     polygon = corn_object['polygon']
@@ -91,26 +87,136 @@ def convert_yolo_format(annotation, H=175., W=480.):
     w   = (annotation['max_x'] - annotation['min_x'])/W
     return {'label' : 0, 'x_c' : x_c, 'y_c' : y_c, 'h' : h, 'w' : w}
 
-def save_labels_in_yolo_format(labels, dir):
-    count_good_imgs = -1
+def save_labels(labels, dir, formats, augment=False):
+    yolo_format = False
+    coco_format = False
+    coco_dict = None
+    for format in formats:
+        if(format=='yolov5'):
+            yolo_format = True
+        if(format=="coco"):
+            coco_format = True
+            coco_dict = create_coco_dict()
+    count_good_imgs = 0
+    augmented_imgs  = 0
+
     pbar = tqdm.tqdm(labels)
     pbar.set_description(dir.split('/')[-1])
+    annotation_number     = 0
+    augmented_annotations = 0
     for label in pbar:
-        annotations = []
+        yolo_annotations = []
+        coco_annotations = []
         if(len(label['Label']['objects']) > 0):
             if(label['Label']['objects'][0]['title'] != 'no_seed'):
-                count_good_imgs += 1
+                apply_augmentation = False
                 for object in label['Label']['objects']:
                     if(object['title'] =='corn_seed'):
+                        apply_augmentation = True*augment
                         temp_ann = convert_corn_label_box(object)
                     elif(object['title']=='blury_seed'):
                         temp_ann = convert_blurry_label_box(object)
                     else:
                         continue
-                    annotations.append(convert_yolo_format(temp_ann))
-                if(len(annotations) > 0):
-                    download_save_img(label, f'{dir}/images/{count_good_imgs}.JPEG')
-                    save_annotations_yolo_format(annotations, f'{dir}/labels/{count_good_imgs}.txt')
+                    yolo_annotations.append(convert_yolo_format(temp_ann))
+                    coco_annotations.append(convert_coco_format(temp_ann, annotation_number+augmented_annotations, count_good_imgs+augmented_imgs))
+                    annotation_number += 1
+                if(len(yolo_annotations) > 0):
+                    img = download_img(label)
+                    if apply_augmentation:
+                        imgs, augmented_yolo_annotations, augmented_coco_annotations = apply_augmentations(img, yolo_annotations, coco_annotations, img_idx=count_good_imgs+augmented_imgs)
+                        for i, img in enumerate(imgs):
+                            save_data_row(img, yolo_format, coco_format, augmented_yolo_annotations[i], augmented_coco_annotations[i], count_good_imgs+augmented_imgs+i, coco_dict, dir)
+                        augmented_imgs += len(imgs) - 1
+                        augmented_annotations += (len(imgs) - 1)*len(augmented_coco_annotations[0])
+                    else:
+                        save_data_row(img, yolo_format, coco_format, yolo_annotations, coco_annotations, count_good_imgs+augmented_imgs, coco_dict, dir)
+                        cv2.imwrite(f'{dir}/images/{count_good_imgs+augmented_imgs}.jpg', img)
+#                        if(yolo_format):
+#                            save_annotations_yolo_format(yolo_annotations, f'{dir}/labels/{count_good_imgs}.txt')
+#                        if(coco_format):
+#                            coco_dict = save_annotations_coco_format(coco_annotations, coco_dict, count_good_imgs)
+                    count_good_imgs += 1
+
+    if coco_format:
+        with open(f'{dir}/images/_annotations.coco.json', 'w') as f:
+            json.dump(coco_dict, f, indent=4)
+    print(f"Wrote {count_good_imgs} Images with {annotation_number} annotations into {dir}")
+
+def save_data_row(img, yolo_format, coco_format, yolo_annotations, coco_annotations, img_id, coco_dict, dir):
+    cv2.imwrite(f'{dir}/images/{img_id}.jpg', img)
+    H, W, C = img.shape
+    if (yolo_format):
+        save_annotations_yolo_format(yolo_annotations, f'{dir}/labels/{img_id}.txt')
+    if (coco_format):
+        coco_dict = save_annotations_coco_format(coco_annotations, coco_dict, img_id, H, W)
+    return coco_dict
+
+def convert_coco_format(annoation, annotation_number, img_id):
+    w = int(annoation['max_x'] - annoation['min_x'])
+    h = int(annoation['max_y'] - annoation['min_y'])
+    return {'id': annotation_number,
+            'image_id': img_id,
+            'category_id': 0,
+            'bbox': [int(annoation['min_x']),
+                     int(annoation['min_y']),
+                     w,
+                     h],
+            'area': h*w,
+            'segmentation': [],
+            'iscrowd': 0}
+
+
+
+def save_annotations_coco_format(annotations, dict, img_id, H, W):
+    dict['images'].append({'id': img_id,
+                           'license': 1,
+                           'file_name': f'{img_id}.jpg',
+                           'height': H,
+                           'width': W,
+                           'date_captured': date.today().strftime("%Y-%m-%d")})
+
+    dict['annotations'].append(annotations)
+
+    return dict
+
+def create_coco_dict():
+    return {'info': {'year': date.today().strftime("%Y"),
+                     'version': '0',
+                     'description': 'Created By the Script',
+                     'contributor': 'r4hul',
+                     'url': '',
+                     'date_created': date.today().strftime("%Y-%m-%d")},
+
+            'licenses': [{'id': 1,
+                          'url': 'https://creativecommons.org/licenses/by/4.0/',
+                          'name': 'CC BY 4.0'}],
+
+            'categories': [{'id': 0, 'name': 'seed', 'supercategory': 'none'}],
+                           #,{'id': 1, 'name': 'seed', 'supercategory': 'seeds'}]
+
+            'images' : [],
+
+            'annotations' : []
+
+            }
+
+
+def apply_augmentations(img, yolo_annotations, coco_annotations, img_idx):
+    ret_imgs, ret_yolo, ret_coco = [], [], []
+    for i in range(3):
+        a_img, a_yolo, a_coco = copy_augmentation(img, yolo_annotations, coco_annotations, i, img_idx)
+        ret_imgs.append(a_img)
+        ret_yolo.append(a_yolo)
+        ret_coco.append(a_coco)
+    return ret_imgs, ret_yolo, ret_coco
+
+def copy_augmentation(img, yolo, coco, idx, img_idx):
+    ret = copy.deepcopy(coco)
+    for i, ann in enumerate(ret) :
+        ret[i]["id"] += idx*len(coco) + i
+        ret[i]["image_id"] = idx + img_idx
+    return img, yolo, ret
 
 def save_annotations_yolo_format(annotations, txt_file):
     with open(txt_file, 'w') as file:
@@ -119,18 +225,17 @@ def save_annotations_yolo_format(annotations, txt_file):
 
 def create_yaml_file(dir, dirs):
     with open(os.path.join(dir, 'data.yaml'), 'w') as f:
-        print(dirs)
         for named_dir in dirs.keys():
             f.write(f"{named_dir} : {dirs[named_dir]}/\n")
         f.write("\n")
         f.write("nc : 1\nnames : ['seed']")
 
 if __name__ == '__main__':
-    dir = os.path.join(os.path.expanduser("~"), date.today().strftime("%m-%d"), 'yolov5')
+    dir = os.path.join(os.path.expanduser("~"), "dataset", date.today().strftime("%m-%d"))
     os.makedirs(dir, exist_ok=True)
-    dirs = setup_dir_for_yolo(dir)
+    dirs = setup_dir(dir)
     for dir in dirs.keys():
-        save_labels_in_yolo_format(splited_labels[dir], dirs[dir])
+        save_labels(splited_labels[dir], dirs[dir], ["yolov5", "coco"], augment=False)
 
 
 
