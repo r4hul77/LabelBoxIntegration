@@ -1,7 +1,7 @@
 # This is a sample Python script.
 # Press Shift+F10 to execute it or replace it with your code.
 # Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
-
+#!/home/r4hul/PycharnProjects/LabelBox/venv/bin/python 
 
 import requests, io, cv2, tqdm, urllib, labelbox, json, os, copy
 import pandas as pd
@@ -9,6 +9,8 @@ import numpy as np
 from PIL import Image
 from sklearn.model_selection import train_test_split
 from datetime import date
+import logging
+logging.basicConfig(filename='main.log', level=logging.DEBUG)
 #Seed
 np.random.seed(69)
 # Enter your Labelbox API key here
@@ -23,7 +25,58 @@ lb = labelbox.Client(api_key=LB_API_KEY)
 project = lb.get_project('cl2t7enc9ehdb076f78hrg8n0')
 
 # Export image and text data as an annotation generator:
+class BaseTransform:
+    #Base Class For Transforms
+    def __init__(self):
+        self.total_imgs = 0
 
+    def transform(self, img, annotations):
+        return img, annotations
+
+class ResizeTransformWidthBased(BaseTransform):
+
+    def __init__(self, target_width):
+        super().__init__()
+        self.target_width = target_width
+
+    def transform(self, img, annotations):
+        logging.debug(f"[ResizeWidthBasedTransform.tranform] input (img shape {img.shape}, annotations {annotations}")
+        H, W, _ = img.shape
+        r = self.target_width/W
+        resize_img = cv2.resize(img, (self.target_width, int(r*H)))
+        resized_annotations = copy.deepcopy(annotations)
+        for annotation in resized_annotations:
+            annotation['min_x'] *= r
+            annotation['max_x'] *= r
+            annotation['min_y'] *= r
+            annotation['max_y'] *= r
+        logging.debug(f"[ResizeWidthBasedTransform.tranform] Ouput (img shape {resize_img.shape}, annotations {resized_annotations}")
+        return resize_img, resized_annotations
+
+class RandomLetterBoxTransform(BaseTransform):
+
+    def __init__(self, target_shape, fill=[0, 0, 0]): #Target Shape (H, W)
+        super().__init__()
+        self.target_h = target_shape[0]
+        self.target_w = target_shape[1]
+        self.fill = fill
+
+    def transform(self, img, annotations):
+        logging.debug(f"[RandomLetterBoxTranform.tranform] input (img shape {img.shape}, annotations {annotations})")
+        H, W, _ = img.shape
+        delta_h = self.target_h - H
+        delta_w = self.target_w - W
+        t_h = np.random.randint(0, delta_h+1)
+        t_w = np.random.randint(0, delta_w+1)
+        letterbox_img = cv2.copyMakeBorder(img, t_h, delta_h - t_h, t_w, delta_w - t_w, cv2.BORDER_CONSTANT, value=self.fill)
+        lettebox_annotations = copy.deepcopy(annotations)
+        for annotation in lettebox_annotations:
+            annotation['min_x'] += t_w
+            annotation['max_x'] += t_w
+            annotation['min_y'] += t_h
+            annotation['max_y'] += t_h
+        logging.debug(f"[RandomLetterBoxTranform.tranform] input (img shape {letterbox_img.shape}, annotations {lettebox_annotations})")
+        return letterbox_img, lettebox_annotations
 
 with urllib.request.urlopen(project.export_labels()) as url:
     labels_export = json.loads(url.read().decode())
@@ -87,7 +140,7 @@ def convert_yolo_format(annotation, H=175., W=480.):
     w   = (annotation['max_x'] - annotation['min_x'])/W
     return {'label' : 0, 'x_c' : x_c, 'y_c' : y_c, 'h' : h, 'w' : w}
 
-def save_labels(labels, dir, formats, augment=False):
+def save_labels(labels, dir, formats, augment=False, TransformsList=[BaseTransform()]):
     yolo_format = False
     coco_format = False
     coco_dict = None
@@ -107,6 +160,7 @@ def save_labels(labels, dir, formats, augment=False):
     for label in pbar:
         yolo_annotations = []
         coco_annotations = []
+        annotations = []
         if(len(label['Label']['objects']) > 0):
             if(label['Label']['objects'][0]['title'] != 'no_seed'):
                 apply_augmentation = False
@@ -118,11 +172,18 @@ def save_labels(labels, dir, formats, augment=False):
                         temp_ann = convert_blurry_label_box(object)
                     else:
                         continue
-                    yolo_annotations.append(convert_yolo_format(temp_ann))
-                    coco_annotations.append(convert_coco_format(temp_ann, annotation_number+augmented_annotations, count_good_imgs+augmented_imgs))
-                    annotation_number += 1
-                if(len(yolo_annotations) > 0):
+                    annotations.append(temp_ann)
+                if(len(annotations) > 0):
                     img = download_img(label)
+
+                    for transform in TransformsList:
+                        img, annotations = transform.transform(img, annotations)
+
+                    for annotation in annotations:
+                        yolo_annotations.append(convert_yolo_format(annotation))
+                        coco_annotations.append(convert_coco_format(annotation, annotation_number + augmented_annotations,
+                                                                    count_good_imgs + augmented_imgs))
+                        annotation_number += 1
                     if apply_augmentation:
                         imgs, augmented_yolo_annotations, augmented_coco_annotations = apply_augmentations(img, yolo_annotations, coco_annotations, img_idx=count_good_imgs+augmented_imgs)
                         for i, img in enumerate(imgs):
@@ -231,11 +292,11 @@ def create_yaml_file(dir, dirs):
         f.write("nc : 1\nnames : ['seed']")
 
 if __name__ == '__main__':
-    dir = os.path.join(os.path.expanduser("~"), "dataset", date.today().strftime("%m-%d"))
+    dir = os.path.join(os.path.expanduser("~"), "dataset_test_trans", date.today().strftime("%m-%d"))
     os.makedirs(dir, exist_ok=True)
     dirs = setup_dir(dir)
     for dir in dirs.keys():
-        save_labels(splited_labels[dir], dirs[dir], ["yolov5", "coco"], augment=False)
+        save_labels(splited_labels[dir][:10], dirs[dir], ["yolov5", "coco"], augment=False, TransformsList=[ResizeTransformWidthBased(256), RandomLetterBoxTransform((256, 256))])
 
 
 
