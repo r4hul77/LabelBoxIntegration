@@ -1,7 +1,7 @@
 # This is a sample Python script.
 # Press Shift+F10 to execute it or replace it with your code.
 # Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
-#!/home/r4hul/PycharnProjects/LabelBox/venv/bin/python 
+#!/home/r4hul/PycharmProjects/LabelBox/venv/bin/python
 
 import requests, io, cv2, tqdm, urllib, labelbox, json, os, copy
 import pandas as pd
@@ -292,11 +292,11 @@ def create_yaml_file(dir, dirs):
         f.write("nc : 1\nnames : ['seed']")
 
 if __name__ == '__main__':
-    dir = os.path.join(os.path.expanduser("~"), "dataset_test_trans", date.today().strftime("%m-%d"))
+    dir = os.path.join(os.path.expanduser("~"), "dataset", date.today().strftime("%m-%d"))
     os.makedirs(dir, exist_ok=True)
     dirs = setup_dir(dir)
     for dir in dirs.keys():
-        save_labels(splited_labels[dir][:10], dirs[dir], ["yolov5", "coco"], augment=False, TransformsList=[ResizeTransformWidthBased(256), RandomLetterBoxTransform((256, 256))])
+        save_labels(splited_labels[dir], dirs[dir], ["yolov5", "coco"], augment=False, TransformsList=[ResizeTransformWidthBased(256), RandomLetterBoxTransform((256, 256))])
 
 
 
