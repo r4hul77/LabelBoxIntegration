@@ -11,6 +11,9 @@ class BaseAugmentation:
     def augment(self, img, annotations):
         return img, annotations
 
+    def register(self, img, object):
+        pass
+
 
 class NoiseAugmentation(BaseAugmentation):
 
@@ -23,7 +26,7 @@ class NoiseAugmentation(BaseAugmentation):
     def augment(self, img, annotations):
         H, W, C = img.shape
         gauss = np.random.normal(self.mean, self.sigma, (H, W, C))
-        gauss = gauss.reshape(H, W, C)
+        gauss = 255*gauss.reshape(H, W, C)
         noise_img = img + gauss
         return noise_img, annotations
 
@@ -61,6 +64,7 @@ class GaussBlurAugmentation(BaseAugmentation):
 
     def augment(self, img, annotations):
         k = np.random.randint(1, self.max_k)
+        k += k%2 == 0 #Just to make sure the random number is odd there could be a better way of doing it
         gauss_img = cv2.GaussianBlur(img, (k, k), cv2.BORDER_DEFAULT)
         return gauss_img, annotations
 
@@ -73,7 +77,7 @@ class AddObjectsAugmentation(BaseAugmentation):
         self.max_objects = max_objects
         self.queue = []
 
-    def add_to_queue(self, img, object):
+    def register(self, img, object):
         self.total_aug += 1
         if (len(self.queue) == self.max_list):
             self.queue.__delitem__(np.random.randint(self.max_list))
@@ -89,11 +93,7 @@ class AddObjectsAugmentation(BaseAugmentation):
         #cv2.drawContours(mask, [pts], -1, (255, 255, 255), -1, cv2.LINE_AA)
         dst = cv2.bitwise_and(croped, croped, mask=mask)
         cv2.imwrite(f'{self.total_aug}.jpg', dst)
-        annotation['max_y'] -= annotation['min_y']
-        annotation['max_x'] -= annotation['min_x']
-        annotation['min_x'] = 0
-        annotation['min_y'] = 0
-        self.queue.append([dst, annotation, pts])
+        self.queue.append([dst, pts])
 
     def get_points_from_object(self, object):
         polygon = object['polygon']
@@ -110,23 +110,25 @@ class AddObjectsAugmentation(BaseAugmentation):
         return new_img, new_annotations
 
     def augment_img(self, img, annotations):
-        add_img, add_annotation, pts = self.queue[np.random.randint(len(self.queue))]
+        obj_intrst = np.random.randint(len(self.queue))
+        add_img, pts = self.queue[obj_intrst]
         H, W, C = img.shape
         img2 = img.copy()
-        p_x, p_y = np.random.randint(W-add_annotation['max_y']+add_annotation['min_y']),\
-                   np.random.randint(H-add_annotation['max_x']+add_annotation['min_x'])
-        new_annotation = self.create_new_annotation(add_annotation, p_x, p_y)
+        object_height, object_width, _ = add_img.shape
+        p_x, p_y = np.random.randint(W - object_width),\
+                   np.random.randint(H - object_height)
+        new_annotation = self.create_new_annotation(object_width, object_height, p_x, p_y)
         cv2.fillPoly(img2, pts=np.array([pts + np.array([p_x, p_y])], dtype=np.int32), color=(0, 0, 0))
         self.copy_img(img2, add_img, new_annotation)
         annotations.append(new_annotation)
         return img2, annotations
 
-    def create_new_annotation(self, add_annotation, px, py):
-        new_annotation = copy.deepcopy(add_annotation)
-        new_annotation['min_y'] += py
-        new_annotation['max_y'] += py
-        new_annotation['max_x'] += px
-        new_annotation['min_x'] += px
+    def create_new_annotation(self, object_width, object_height, px, py):
+        new_annotation = {}
+        new_annotation['min_y']  = py
+        new_annotation['max_y']  = object_height + py
+        new_annotation['max_x']  = px + object_width
+        new_annotation['min_x']  = px
         return new_annotation
 
     def copy_img(self, croped_img, add_img, new_annotation):

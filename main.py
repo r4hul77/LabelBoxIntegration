@@ -12,15 +12,46 @@ from datetime import date
 import logging
 from augmentations import *
 from label_convertors import *
+import sendgrid
+import os
+from sendgrid.helpers.mail import Mail, Email, To, Content
+
+
 logging.basicConfig(filename='main.log', level=logging.DEBUG)
 #Seed
 np.random.seed(69)
 # Enter your Labelbox API key here
-LB_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJjbDJ0NzF6aHQzYzV4MDc5M2dwbGE2eXZrIiwib3JnYW5pemF0aW9uSWQiOiJjbDJ0NzF6aGgzYzV3MDc5M2hteGcxc2pvIiwiYXBpS2V5SWQiOiJjbDNhaGs1c3ExNDFoMDc3M2RtcG9oYmRuIiwic2VjcmV0IjoiYTAyYzhmNDIwMjIyNDFmZWQ5YTg5MWIxMGY5YWVjYWIiLCJpYXQiOjE2NTI4MTE5NDgsImV4cCI6MjI4Mzk2Mzk0OH0.Tsp0Fxrzesx9D7RRHh3PVv9JJwqAFk-jegdsZ_7zp_Q"
+def grab_api_keys(file_name):
+    with open(file_name, 'r') as f:
+        lines = f.readlines()
+    ret = {}
+    for line in lines:
+        api_provider, api_key = line.split()
+        ret[api_provider] = api_key
+    return ret
+
+from_email = Email("farmslab2020@aol.com")
+
+def send_mail(user, content, subject="It Worked"):
+    # Change to your recipient
+    to_email = To(user)
+
+    content = Content("text/plain", content)
+
+    mail = Mail(from_email, to_email, subject, content)
+
+    # Get a JSON-ready representation of the Mail object
+    mail_json = mail.get()
+
+    # Send an HTTP POST request to /mail/send
+    response = my_sg.client.mail.send.post(request_body=mail_json)
+
+api_keys = grab_api_keys('/home/r4hul/PycharmProjects/LabelBox/api_keys')
 
 # Create Labelbox client
+lb = labelbox.Client(api_key=api_keys['label_box'])
+my_sg = sendgrid.SendGridAPIClient(api_key=api_keys['send_grid'])
 
-lb = labelbox.Client(api_key=LB_API_KEY)
 
 # Get project by ID
 
@@ -137,7 +168,7 @@ def convert_yolo_format(annotation, H=175., W=480.):
     w   = (annotation['max_x'] - annotation['min_x'])/W
     return {'label' : 0, 'x_c' : x_c, 'y_c' : y_c, 'h' : h, 'w' : w}
 
-def save_labels(labels, dir, formats, augment=False, TransformsList=[BaseTransform()], Augmentations_List=[AddObjectsAugmentation(10, 4)]):
+def save_labels(labels, dir, formats, augment=False, TransformsList=[BaseTransform()], Augmentations_List=[GaussBlurAugmentation(15)], copies=4):
     yolo_format = False
     coco_format = False
     coco_dict = None
@@ -166,7 +197,8 @@ def save_labels(labels, dir, formats, augment=False, TransformsList=[BaseTransfo
                     if(object['title'] =='corn_seed'):
                         apply_augmentation = True*augment
                         if(apply_augmentation):
-                            Augmentations_List[0].add_to_queue(img, object)
+                            for augmentation in Augmentations_List:
+                                augmentation.register(img, object)
                         temp_ann = convert_corn_label_box(object)
                     elif(object['title']=='blury_seed'):
                         temp_ann = convert_blurry_label_box(object)
@@ -180,7 +212,7 @@ def save_labels(labels, dir, formats, augment=False, TransformsList=[BaseTransfo
                         img, annotations = transform.transform(img, annotations)
 
                     if apply_augmentation:
-                        imgs, annotations_list = apply_augmentations(img, annotations, Augmentations_List)
+                        imgs, annotations_list = apply_augmentations(img, annotations, Augmentations_List, copies)
                         augmented_annotations += len(annotations_list)
                         augmented_imgs += len(imgs)
                     else:
@@ -202,7 +234,7 @@ def save_labels(labels, dir, formats, augment=False, TransformsList=[BaseTransfo
     if coco_format:
         with open(f'{dir}/images/_annotations.coco.json', 'w') as f:
             json.dump(coco_dict, f, indent=4)
-    print(f"Wrote {total_imgs} Images with {annotation_number} annotations into {dir} with {augmented_imgs} augmented Imgs and {augmented_annotations} augmented annotations")
+    return f"Wrote {total_imgs} Images with {annotation_number} annotations into {dir} with {augmented_imgs} augmented Imgs and {augmented_annotations} augmented annotations"
 
 def save_data_row(img, yolo_format, coco_format, yolo_annotations, coco_annotations, img_id, coco_dict, dir):
     cv2.imwrite(f'{dir}/images/{img_id}.jpg', img)
@@ -268,10 +300,12 @@ def create_coco_dict():
 
 
 
-def apply_augmentations(img, annotation, list_of_augmentations=[BaseAugmentation(), BaseAugmentation(), BaseAugmentation()]):
+def apply_augmentations(img, annotation, list_of_augmentations=[BaseAugmentation(), BaseAugmentation(), BaseAugmentation()], copies=4):
     ret_imgs, ret_annotations = [], []
-    for augmentation in list_of_augmentations:
-        aug_img, aug_annotation = augmentation.augment(img, annotation)
+    for i in range(copies):
+        aug_img, aug_annotation = img.copy(), copy.deepcopy(annotation)
+        for augmentation in list_of_augmentations:
+            aug_img, aug_annotation = augmentation.augment(aug_img, aug_annotation)
         ret_imgs.append(aug_img)
         ret_annotations.append(aug_annotation)
     return ret_imgs, ret_annotations
@@ -297,12 +331,16 @@ def create_yaml_file(dir, dirs):
         f.write("nc : 1\nnames : ['seed']")
 
 if __name__ == '__main__':
-    dir = os.path.join(os.path.expanduser("~"), "dataset_test", date.today().strftime("%m-%d"))
+    augmentations_list = [AddObjectsAugmentation(100, 4), HsvAugmentation(0.5, 0.25, 0.5), NoiseAugmentation(0, 0.005), GaussBlurAugmentation(15)]
+    dir = os.path.join(os.path.expanduser("~"), "dataset", date.today().strftime("%m-%d"))
     os.makedirs(dir, exist_ok=True)
     dirs = setup_dir(dir)
+    content = f""
     for dir in dirs.keys():
-        save_labels(splited_labels[dir][:100], dirs[dir], ["yolov5", "coco"], augment=dir == "train", TransformsList=[ResizeTransformWidthBased(512), RandomLetterBoxTransform((512, 512))])
+        content += save_labels(splited_labels[dir], dirs[dir], ["yolov5", "coco"], augment=dir == "train",
+                    TransformsList=[ResizeTransformWidthBased(512), RandomLetterBoxTransform((512, 512))],
+                    Augmentations_List=augmentations_list) + "\n"
     print("Wrote Imgs and Labels Smoothly")
-
+    send_mail("r4hul@ksu.edu", content, "Img Download Complete")
 
 # See PyCharm help at https://www.jetbrains.com/help/pycharm/
