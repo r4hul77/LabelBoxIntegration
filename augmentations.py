@@ -77,7 +77,7 @@ class AddObjectsAugmentation(BaseAugmentation):
         self.max_objects = max_objects
         self.queue = []
 
-    def register(self, img, object):
+    def register(self, img, object, debug=False):
         self.total_aug += 1
         if (len(self.queue) == self.max_list):
             self.queue.__delitem__(np.random.randint(self.max_list))
@@ -90,9 +90,9 @@ class AddObjectsAugmentation(BaseAugmentation):
         pts = points - points.min(axis=0)
         mask = np.zeros(croped.shape[:2], np.uint8)
         cv2.fillPoly(mask, pts=np.array([pts], dtype=np.int32), color=255)
-        #cv2.drawContours(mask, [pts], -1, (255, 255, 255), -1, cv2.LINE_AA)
         dst = cv2.bitwise_and(croped, croped, mask=mask)
-        cv2.imwrite(f'{self.total_aug}.jpg', dst)
+        if debug:
+            cv2.imwrite(f'{self.total_aug}.jpg', dst)
         self.queue.append([dst, pts])
 
     def get_points_from_object(self, object):
@@ -105,23 +105,28 @@ class AddObjectsAugmentation(BaseAugmentation):
         new_img = img.copy()
         new_annotations = copy.deepcopy(annotations)
         for i in range(number_new_objs):
-        #for i in range(number_new_objs):
             new_img, new_annotations = self.augment_img(new_img, new_annotations)
         return new_img, new_annotations
 
     def augment_img(self, img, annotations):
         obj_intrst = np.random.randint(len(self.queue))
-        add_img, pts = self.queue[obj_intrst]
+        object, pts = self.queue[obj_intrst]
         H, W, C = img.shape
-        img2 = img.copy()
-        object_height, object_width, _ = add_img.shape
+        object_height, object_width, _ = object.shape
         p_x, p_y = np.random.randint(W - object_width),\
                    np.random.randint(H - object_height)
-        new_annotation = self.create_new_annotation(object_width, object_height, p_x, p_y)
-        cv2.fillPoly(img2, pts=np.array([pts + np.array([p_x, p_y])], dtype=np.int32), color=(0, 0, 0))
-        self.copy_img(img2, add_img, new_annotation)
+        img2, new_annotation = self.add_object(img, pts, object, p_x, p_y)
         annotations.append(new_annotation)
         return img2, annotations
+
+    def add_object(self, img, pts, object, px, py):
+        img2 = img.copy()
+        object_height, object_width, _ = object.shape
+        new_annotation = self.create_new_annotation(object_width, object_height, px, py)
+        cv2.fillPoly(img2, pts=np.array([pts + np.array([px, py])], dtype=np.int32), color=(0, 0, 0))
+        self.copy_img(img2, object, new_annotation)
+        return img2, new_annotation
+
 
     def create_new_annotation(self, object_width, object_height, px, py):
         new_annotation = {}

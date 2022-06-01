@@ -2,6 +2,7 @@
 # Press Shift+F10 to execute it or replace it with your code.
 # Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
 #!/home/r4hul/PycharmProjects/LabelBox/venv/bin/python
+import base64
 
 import requests, io, cv2, tqdm, urllib, labelbox, json, os, copy
 import pandas as pd
@@ -14,12 +15,15 @@ from augmentations import *
 from label_convertors import *
 import sendgrid
 import os
-from sendgrid.helpers.mail import Mail, Email, To, Content
+from sendgrid.helpers.mail import Mail, Email, To, Content, Attachment, FileContent, FileName, FileType, Disposition
 
 
 logging.basicConfig(filename='main.log', level=logging.DEBUG)
 #Seed
 np.random.seed(69)
+#Email Content
+content = f""
+
 # Enter your Labelbox API key here
 def grab_api_keys(file_name):
     with open(file_name, 'r') as f:
@@ -32,19 +36,33 @@ def grab_api_keys(file_name):
 
 from_email = Email("farmslab2020@aol.com")
 
-def send_mail(user, content, subject="It Worked"):
+def send_mail(users, content, subject="It Worked", attachment=None):
     # Change to your recipient
-    to_email = To(user)
+    to_emails = []
+    for user in users:
+        to_emails.append(To(user))
 
     content = Content("text/plain", content)
 
-    mail = Mail(from_email, to_email, subject, content)
+    mail = Mail(from_email, to_emails, subject, content)
+
+    if attachment:
+        with open(attachment, 'rb') as f:
+
+            encoded_file = base64.b64encode(f.read()).decode()
+
+        attachedFile = Attachment(
+            FileContent(encoded_file),
+            FileName(attachment.split('/')[-1]),
+            FileType('application/txt'),
+            Disposition('attachment')
+        )
+        mail.attachment = attachedFile
 
     # Get a JSON-ready representation of the Mail object
-    mail_json = mail.get()
 
     # Send an HTTP POST request to /mail/send
-    response = my_sg.client.mail.send.post(request_body=mail_json)
+    response = my_sg.send(mail)
 
 api_keys = grab_api_keys('/home/r4hul/PycharmProjects/LabelBox/api_keys')
 
@@ -86,7 +104,8 @@ class ResizeTransformWidthBased(BaseTransform):
             annotation['max_x'] *= r
             annotation['min_y'] *= r
             annotation['max_y'] *= r
-        logging.debug(f"[ResizeWidthBasedTransform.tranform] Ouput (img shape {resize_img.shape}, annotations {resized_annotations}")
+        logging.debug(f"[ResizeWidthBasedTransform.tranform] Ouput "
+                      f"(img shape {resize_img.shape}, annotations {resized_annotations}")
         return resize_img, resized_annotations
 
 class RandomLetterBoxTransform(BaseTransform):
@@ -104,21 +123,30 @@ class RandomLetterBoxTransform(BaseTransform):
         delta_w = self.target_w - W
         t_h = np.random.randint(0, delta_h+1)
         t_w = np.random.randint(0, delta_w+1)
-        letterbox_img = cv2.copyMakeBorder(img, t_h, delta_h - t_h, t_w, delta_w - t_w, cv2.BORDER_CONSTANT, value=self.fill)
+        letterbox_img = cv2.copyMakeBorder(img, t_h, delta_h - t_h,
+                                           t_w, delta_w - t_w, cv2.BORDER_CONSTANT, value=self.fill)
         lettebox_annotations = copy.deepcopy(annotations)
         for annotation in lettebox_annotations:
             annotation['min_x'] += t_w
             annotation['max_x'] += t_w
             annotation['min_y'] += t_h
             annotation['max_y'] += t_h
-        logging.debug(f"[RandomLetterBoxTranform.tranform] input (img shape {letterbox_img.shape}, annotations {lettebox_annotations})")
+        logging.debug(f"[RandomLetterBoxTranform.tranform] input (img shape {letterbox_img.shape},"
+                      f" annotations {lettebox_annotations})")
         return letterbox_img, lettebox_annotations
 
 with urllib.request.urlopen(project.export_labels()) as url:
     labels_export = json.loads(url.read().decode())
 
+labels = list(filter(lambda label: 
+                (len(label['Label']['objects']) > 0) and 
+                (label['Label']['objects'][0]['title'] != 'no_seed'),
+                labels_export)
+                )
+content += f"Total Data Rows : {len(labels_export)}, filtered to : {len(labels)}\n"
+
 splited_labels = {}
-splited_labels['train'], splited_labels['test'] = train_test_split(labels_export, test_size=0.2)
+splited_labels['train'], splited_labels['test'] = train_test_split(labels, test_size=0.2)
 splited_labels['train'], splited_labels['val']  = train_test_split(splited_labels['train'], test_size=0.2)
 
 def mkdir(dir, name):
@@ -152,7 +180,8 @@ def get_quality_imgs(labels_export):
                         total_corn_seeds += 1
                     else:
                         total_blurry_seeds += 1
-    return {'total_seeds': total_seeds, 'total_good_imgs': total_good_data, 'total_corn_seeds':total_corn_seeds, 'total_blurry':total_blurry_seeds}
+    return {'total_seeds': total_seeds, 'total_good_imgs': total_good_data,
+            'total_corn_seeds' : total_corn_seeds, 'total_blurry' : total_blurry_seeds}
 # Press the green button in the gutter to run the script.
 
 def download_img(label):
@@ -163,15 +192,19 @@ def download_img(label):
 
 def convert_yolo_format(annotation, H=175., W=480.):
     x_c = (annotation['min_x'] + annotation['max_x'])/(2*W)
-    y_c = (annotation['min_y'] + annotation['min_y'])/(2*H)
+    y_c = (annotation['min_y'] + annotation['max_y'])/(2*H)
     h   = (annotation['max_y'] - annotation['min_y'])/H
     w   = (annotation['max_x'] - annotation['min_x'])/W
-    return {'label' : 0, 'x_c' : x_c, 'y_c' : y_c, 'h' : h, 'w' : w}
+    return {'label' : 0, 'x_c' : x_c, 'y_c' : y_c, 'w' : w, 'h' : h}
 
-def save_labels(labels, dir, formats, augment=False, TransformsList=[BaseTransform()], Augmentations_List=[GaussBlurAugmentation(15)], copies=4):
+def save_labels(labels, dir, formats, augment=False, TransformsList=[BaseTransform()],
+                Augmentations_List=[GaussBlurAugmentation(15)], copies=4, debug=False):
+
     yolo_format = False
     coco_format = False
     coco_dict = None
+    if debug:
+        os.makedirs('debug', exist_ok=True)
     for format in formats:
         if(format=='yolov5'):
             yolo_format = True
@@ -219,12 +252,17 @@ def save_labels(labels, dir, formats, augment=False, TransformsList=[BaseTransfo
                         imgs = [img]
                         annotations_list = [annotations]
                     for img, annotations in zip(imgs, annotations_list):
+                        yolo_annotations = []
+                        coco_annotations = []
                         for annotation in annotations:
-                            yolo_annotations.append(convert_yolo_format(annotation))
+                            img_h, img_w, _ = img.shape
+                            yolo_annotations.append(convert_yolo_format(annotation, H=img_h, W=img_w))
                             coco_annotations.append(convert_coco_format(annotation, annotation_number + augmented_annotations,
                                                                         total_imgs))
                             annotation_number += 1
-                        save_data_row(img, yolo_format, coco_format, yolo_annotations, coco_annotations, total_imgs, coco_dict, dir)
+                        if debug:
+                            save_og_annotations(img, annotations, total_imgs)
+                        save_data_row(img, yolo_format, coco_format, yolo_annotations, coco_annotations, total_imgs, coco_dict, dir, debug)
 #                        if(yolo_format):
 #                            save_annotations_yolo_format(yolo_annotations, f'{dir}/labels/{count_good_imgs}.txt')
 #                        if(coco_format):
@@ -234,16 +272,54 @@ def save_labels(labels, dir, formats, augment=False, TransformsList=[BaseTransfo
     if coco_format:
         with open(f'{dir}/images/_annotations.coco.json', 'w') as f:
             json.dump(coco_dict, f, indent=4)
-    return f"Wrote {total_imgs} Images with {annotation_number} annotations into {dir} with {augmented_imgs} augmented Imgs and {augmented_annotations} augmented annotations"
+    return f"Wrote {total_imgs} Images with {annotation_number} annotations into {dir}" \
+           f" with {augmented_imgs} augmented Imgs and {augmented_annotations} augmented annotations"
 
-def save_data_row(img, yolo_format, coco_format, yolo_annotations, coco_annotations, img_id, coco_dict, dir):
+def save_og_annotations(img, annotations, img_idx):
+    img_r = img.copy()
+    for annotation in annotations:
+        img_r = cv2.rectangle(img_r, (int(annotation['min_x']), int(annotation['min_y'])),
+                              (int(annotation['max_x']), int(annotation['max_y'])), color=(0, 0, 255), thickness=3)
+    cv2.imwrite(f'debug/og_{img_idx}.jpg', img_r)
+
+def save_data_row(img, yolo_format, coco_format, yolo_annotations, coco_annotations, img_id, coco_dict, dir, debug):
+    logging.debug(f"[save_Data_row] writing image {dir}/images/{img_id}.jpg")
     cv2.imwrite(f'{dir}/images/{img_id}.jpg', img)
     H, W, C = img.shape
     if (yolo_format):
         save_annotations_yolo_format(yolo_annotations, f'{dir}/labels/{img_id}.txt')
+        if debug:
+            cv2.imwrite(f'debug/yolo_{img_id}.jpg', draw_bboxs_yolo(img, yolo_annotations))
     if (coco_format):
         coco_dict = save_annotations_coco_format(coco_annotations, coco_dict, img_id, H, W)
+        if debug:
+            cv2.imwrite(f'debug/coco_{img_id}.jpg', draw_bboxs_coco(img, coco_annotations))
     return coco_dict
+
+
+def draw_bboxs_coco(img, coco_annotations):
+    img_r = img.copy()
+    H, W, C = img.shape
+    for annotation in coco_annotations:
+        min_x = annotation['bbox'][0]
+        max_x = annotation['bbox'][0] + annotation['bbox'][2]
+        min_y = annotation['bbox'][1]
+        max_y = annotation['bbox'][1] + annotation['bbox'][3]
+        img_r = cv2.rectangle(img_r, (min_x, min_y), (max_x, max_y), thickness=3, color=(0, 0, 255))
+    return img_r
+
+def draw_bboxs_yolo(img, yolo_annotations):
+    h, w, c = img.shape
+    img_r = img.copy()
+    for yolo_annotation in yolo_annotations:
+        min_x = int(yolo_annotation['x_c']*w - yolo_annotation['w']*w/2)
+        max_x = int(yolo_annotation['x_c']*w + yolo_annotation['w']*w/2)
+        min_y = int(yolo_annotation['y_c']*h - yolo_annotation['h']*h/2)
+        max_y = int(yolo_annotation['y_c']*h + yolo_annotation['h']*h/2)
+        img_r = cv2.circle(img_r, (int(yolo_annotation['x_c']*w), int(yolo_annotation['y_c']*w)),
+                           radius=0, color=(0, 0, 255), thickness=3)
+        img_r = cv2.rectangle(img_r, (min_x, min_y), (max_x, max_y), (0, 0, 255), 3)
+    return img_r
 
 def convert_coco_format(annoation, annotation_number, img_id):
     w = int(annoation['max_x'] - annoation['min_x'])
@@ -269,7 +345,8 @@ def save_annotations_coco_format(annotations, dict, img_id, H, W):
                            'width': W,
                            'date_captured': date.today().strftime("%Y-%m-%d")})
 
-    dict['annotations'].append(annotations)
+    for annotation in annotations:
+        dict['annotations'].append(annotation)
 
     return dict
 
@@ -300,7 +377,8 @@ def create_coco_dict():
 
 
 
-def apply_augmentations(img, annotation, list_of_augmentations=[BaseAugmentation(), BaseAugmentation(), BaseAugmentation()], copies=4):
+def apply_augmentations(img, annotation,
+                        list_of_augmentations=[BaseAugmentation(), BaseAugmentation(), BaseAugmentation()], copies=4):
     ret_imgs, ret_annotations = [], []
     for i in range(copies):
         aug_img, aug_annotation = img.copy(), copy.deepcopy(annotation)
@@ -321,7 +399,8 @@ def augment_coco(coco, idx, img_idx):
 def save_annotations_yolo_format(annotations, txt_file):
     with open(txt_file, 'w') as file:
         for annotation in annotations:
-            file.write(' '.join(map(lambda  x : str(x), annotation.values()))+'\n')
+            file.write(f'{annotation["label"]} {annotation["x_c"]} {annotation["y_c"]} {annotation["w"]} '
+                       f'{annotation["h"]}'+'\n')
 
 def create_yaml_file(dir, dirs):
     with open(os.path.join(dir, 'data.yaml'), 'w') as f:
@@ -331,16 +410,18 @@ def create_yaml_file(dir, dirs):
         f.write("nc : 1\nnames : ['seed']")
 
 if __name__ == '__main__':
-    augmentations_list = [AddObjectsAugmentation(100, 4), HsvAugmentation(0.5, 0.25, 0.5), NoiseAugmentation(0, 0.005), GaussBlurAugmentation(15)]
+    augmentations_list = [AddObjectsAugmentation(20, 4), HsvAugmentation(0.5, 0.25, 0.5), NoiseAugmentation(0, 0.005),
+                          GaussBlurAugmentation(15)]
     dir = os.path.join(os.path.expanduser("~"), "dataset", date.today().strftime("%m-%d"))
     os.makedirs(dir, exist_ok=True)
     dirs = setup_dir(dir)
-    content = f""
+
     for dir in dirs.keys():
         content += save_labels(splited_labels[dir], dirs[dir], ["yolov5", "coco"], augment=dir == "train",
                     TransformsList=[ResizeTransformWidthBased(512), RandomLetterBoxTransform((512, 512))],
-                    Augmentations_List=augmentations_list) + "\n"
+                    Augmentations_List=augmentations_list, debug=False) + "\n"
+
     print("Wrote Imgs and Labels Smoothly")
-    send_mail("r4hul@ksu.edu", content, "Img Download Complete")
+    send_mail(["r4hul@ksu.edu", "asharda@ksu.edu"], content, "Img Download Complete")
 
 # See PyCharm help at https://www.jetbrains.com/help/pycharm/
