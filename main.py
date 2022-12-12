@@ -3,7 +3,7 @@
 # Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
 #!/home/r4hul/PycharmProjects/LabelBox/venv/bin/python
 import base64
-
+import argparse
 import requests, io, cv2, tqdm, urllib, labelbox, json, os, copy
 import pandas as pd
 import numpy as np
@@ -23,6 +23,11 @@ logging.basicConfig(filename='main.log', level=logging.DEBUG)
 np.random.seed(69)
 #Email Content
 content = f""
+
+
+
+
+
 
 # Enter your Labelbox API key here
 def grab_api_keys(file_name):
@@ -108,13 +113,45 @@ class ResizeTransformWidthBased(BaseTransform):
                       f"(img shape {resize_img.shape}, annotations {resized_annotations}")
         return resize_img, resized_annotations
 
-class RandomLetterBoxTransform(BaseTransform):
+class LetterBoxTransform(BaseTransform):
 
-    def __init__(self, target_shape, fill=[0, 0, 0]): #Target Shape (H, W)
+    def __init__(self, target_shape, fill=[0, 0, 0]):
         super().__init__()
         self.target_h = target_shape[0]
         self.target_w = target_shape[1]
         self.fill = fill
+
+    def transform(self, img, annotation):
+        logging.debug(f"[LetterBoxTranform.tranform] input (img shape {img.shape}, annotations {annotation})")
+        H, W, _ = img.shape
+        p_h = (self.target_h - H)//2
+        p_w = (self.target_w - W)//2
+        return self.apply_letterbox(img, annotation, p_w, p_h)
+
+    def apply_letterbox(self, img, annotation, t_w, t_h):
+        letterbox_annotations = copy.deepcopy(annotation)
+        for annotation in letterbox_annotations:
+            annotation['min_x'] += t_w
+            annotation['max_x'] += t_w
+            annotation['min_y'] += t_h
+            annotation['max_y'] += t_h
+
+        H, W, _ = img.shape
+        delta_h = self.target_h - H
+        delta_w = self.target_w - W
+        letterbox_img = cv2.copyMakeBorder(img, t_h, delta_h - t_h,
+                                           t_w, delta_w - t_w, cv2.BORDER_CONSTANT, value=self.fill)
+
+        logging.debug(f"[Letterbox::tranform] input (img shape {letterbox_img.shape},"
+                      f" annotations {letterbox_annotations})")
+
+        return letterbox_img, letterbox_annotations
+
+
+class RandomLetterBoxTransform(LetterBoxTransform):
+
+    def __init__(self, target_shape, fill=[0, 0, 0]): #Target Shape (H, W)
+        super(RandomLetterBoxTransform, self).__init__(target_shape=target_shape, fill=fill)
 
     def transform(self, img, annotations):
         logging.debug(f"[RandomLetterBoxTranform.tranform] input (img shape {img.shape}, annotations {annotations})")
@@ -123,17 +160,8 @@ class RandomLetterBoxTransform(BaseTransform):
         delta_w = self.target_w - W
         t_h = np.random.randint(0, delta_h+1)
         t_w = np.random.randint(0, delta_w+1)
-        letterbox_img = cv2.copyMakeBorder(img, t_h, delta_h - t_h,
-                                           t_w, delta_w - t_w, cv2.BORDER_CONSTANT, value=self.fill)
-        lettebox_annotations = copy.deepcopy(annotations)
-        for annotation in lettebox_annotations:
-            annotation['min_x'] += t_w
-            annotation['max_x'] += t_w
-            annotation['min_y'] += t_h
-            annotation['max_y'] += t_h
-        logging.debug(f"[RandomLetterBoxTranform.tranform] input (img shape {letterbox_img.shape},"
-                      f" annotations {lettebox_annotations})")
-        return letterbox_img, lettebox_annotations
+
+        return self.apply_letterbox(img, annotations, t_w, t_h)
 
 with urllib.request.urlopen(project.export_labels()) as url:
     labels_export = json.loads(url.read().decode())
@@ -164,6 +192,9 @@ def setup_dir(dir):
         ret[named_dir]=mkdir(dir,named_dir)
     create_yaml_file(dir, ret)
     return ret
+
+def make_setup_for_doubles(dir):
+    return mkdir(dir, 'test_doubles')
 
 def get_quality_imgs(labels_export):
     total_seeds = 0
@@ -196,6 +227,14 @@ def convert_yolo_format(annotation, H=175., W=480.):
     h   = (annotation['max_y'] - annotation['min_y'])/H
     w   = (annotation['max_x'] - annotation['min_x'])/W
     return {'label' : 0, 'x_c' : x_c, 'y_c' : y_c, 'w' : w, 'h' : h}
+
+
+def filter_corn_seeds(list_labels):
+    ret = []
+    for label in list_labels:
+        if(not label['Label']['objects'][0]['title']=='blury_seed'):
+            ret.append(label)
+    return ret
 
 def save_labels(labels, dir, formats, augment=False, TransformsList=[BaseTransform()],
                 Augmentations_List=[GaussBlurAugmentation(15)], copies=4, debug=False):
@@ -241,9 +280,6 @@ def save_labels(labels, dir, formats, augment=False, TransformsList=[BaseTransfo
                 if(len(annotations) > 0):
 
 
-                    for transform in TransformsList:
-                        img, annotations = transform.transform(img, annotations)
-
                     if apply_augmentation:
                         imgs, annotations_list = apply_augmentations(img, annotations, Augmentations_List, copies)
                         augmented_annotations += len(annotations_list)
@@ -252,6 +288,8 @@ def save_labels(labels, dir, formats, augment=False, TransformsList=[BaseTransfo
                         imgs = [img]
                         annotations_list = [annotations]
                     for img, annotations in zip(imgs, annotations_list):
+                        for transform in TransformsList:
+                            img, annotations = transform.transform(img, annotations)
                         yolo_annotations = []
                         coco_annotations = []
                         for annotation in annotations:
@@ -409,19 +447,74 @@ def create_yaml_file(dir, dirs):
         f.write("\n")
         f.write("nc : 1\nnames : ['seed']")
 
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--resize_width', type=int, default=256, help='Image Width')
+    parser.add_argument('--double_aug_prob', type=float, default=0.1)
+    parser.add_argument('--clone_objects', type=int, default=4, help='Add Objects Number Of Objects')
+    parser.add_argument('--queue_size', type=int, default=20, help='Size of Queue for objects registry (Double Aug + Clone)')
+    parser.add_argument('--h_ratio', type=float, default=0.5, help='HSL transform h ratio')
+    parser.add_argument('--s_ratio', type=float, default=0.25, help='HSL transfrom s ratio')
+    parser.add_argument('--l_ratio', type=float, default=0.5, help='HLS Transfrom v ratio')
+    parser.add_argument('--n_mean', type=float, default=0, help='Noise Augmentation Mean')
+    parser.add_argument('--n_stdev', type=float, default=0.005, help='Stdev for Nouse Augmentation')
+    parser.add_argument('--g_k', type=int, default=15, help='max kernel size for gaussian blur')
+
+    opt = parser.parse_args()
+    return opt
+
+
 if __name__ == '__main__':
-    augmentations_list = [AddObjectsAugmentation(20, 4), HsvAugmentation(0.5, 0.25, 0.5), NoiseAugmentation(0, 0.005),
-                          GaussBlurAugmentation(15)]
-    dir = os.path.join(os.path.expanduser("~"), "dataset", date.today().strftime("%m-%d"))
+    args = get_args()
+    #augmentations_list = [DoubleSeedAugmentation(args.queue_size, args.double_aug_prob),
+    #                      AddObjectsAugmentation(args.queue_size, args.clone_objects),
+    #                      HsvAugmentation(args.h_ratio, args.s_ratio, args.v_ratio),
+    #                      NoiseAugmentation(args.n_mean, args.n_stdev),
+    #                      GaussBlurAugmentation(args.g_k)]
+    augmentations_list = []
+    if(args.double_aug_prob > 0):
+        augmentations_list.append(DoubleSeedAugmentation(args.queue_size, args.double_aug_prob))
+    if(args.clone_objects > 0):
+        augmentations_list.append(AddObjectsAugmentation(args.queue_size, args.clone_objects))
+    augmentations_list.append(HlsAugmentation(args.h_ratio, args.l_ratio, args.s_ratio))
+    augmentations_list.append(NoiseAugmentation(args.n_mean, args.n_stdev))
+    augmentations_list.append(GaussBlurAugmentation(args.g_k))
+    dir = os.getenv('DATASET_DIR')
+    if(not dir):
+        print("DATASET_DIR not set using default path")
+        dir = os.path.join(os.path.expanduser("~"), "dataset", date.today().strftime("%m-%d"))
+
     os.makedirs(dir, exist_ok=True)
+    os.makedirs(os.path.join(dir, 'Training_Outputs'), exist_ok=True)
     dirs = setup_dir(dir)
 
-    for dir in dirs.keys():
-        content += save_labels(splited_labels[dir], dirs[dir], ["yolov5", "coco"], augment=dir == "train",
-                    TransformsList=[ResizeTransformWidthBased(512), RandomLetterBoxTransform((512, 512))],
-                    Augmentations_List=augmentations_list, debug=False) + "\n"
+    with open(os.path.join(dir, 'arguments.json'), 'w') as f:
+        json.dump(args.__dict__, f, indent=4)
+
+
+    for dir_now in dirs.keys():
+       content += save_labels(splited_labels[dir_now], dirs[dir_now], ["yolov5", "coco"], augment=dir_now == "train",
+               TransformsList=[ResizeTransformWidthBased(args.resize_width), RandomLetterBoxTransform((args.resize_width, args.resize_width))],
+               Augmentations_List=augmentations_list, debug=False) + "\n"
+
+
+
+
+    test_doubles = make_setup_for_doubles(dir)
+
+    Augmentation_DOUBLES = [DoubleSeedAugmentation(100, 1)]
+    splited_labels['test_doubles'] = filter_corn_seeds(splited_labels['test'])
+    print(splited_labels)
+    content += save_labels(splited_labels['test_doubles'], test_doubles, ["yolov5", "coco"], augment=True,
+                           TransformsList=[ResizeTransformWidthBased(args.resize_width),
+                                           RandomLetterBoxTransform((args.resize_width, args.resize_width))],
+                           Augmentations_List=Augmentation_DOUBLES, debug=False, copies=1) + "\n"
+
+    with open(os.path.join(dir, 'arguments.json'), 'a') as f:
+        f.write(content)
 
     print("Wrote Imgs and Labels Smoothly")
-    send_mail(["r4hul@ksu.edu", "asharda@ksu.edu"], content, "Img Download Complete")
+    #send_mail(["r4hul@ksu.edu", "asharda@ksu.edu", "rahul2401@ksu.edu", "aashvidua@ksu.edu", "bhaskar@ksu.edu"], content, "Img Download Complete")
 
 # See PyCharm help at https://www.jetbrains.com/help/pycharm/
